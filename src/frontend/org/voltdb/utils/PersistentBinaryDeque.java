@@ -21,13 +21,17 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.file.NoSuchFileException;
 import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.Deque;
 import java.util.HashMap;
 import java.util.Iterator;
+import java.util.List;
 import java.util.Map;
+import java.util.NavigableMap;
 import java.util.TreeMap;
 import java.util.zip.CRC32;
 
+import org.jfree.util.Log;
 import org.voltcore.logging.VoltLogger;
 import org.voltcore.utils.DBBPool;
 import org.voltcore.utils.DBBPool.BBContainer;
@@ -118,6 +122,12 @@ public class PersistentBinaryDeque implements BinaryDeque {
                         segmentReader = m_segment.openForRead(m_cursorId);
                     }
                 }
+
+                // Try to cleanup quarantined segments on first poll from a segment
+                if (segmentReader.readIndex() == 0) {
+                    cleanUpQuarantined(m_segment.segmentIndex());
+                }
+
                 BBContainer retcont = segmentReader.poll(ocf, false);
                 if (retcont == null) {
                     return null;
@@ -167,6 +177,40 @@ public class PersistentBinaryDeque implements BinaryDeque {
             if (m_segment == null || m_segment.segmentIndex() < firstSegment.segmentIndex()) {
                 m_segment = firstSegment;
             }
+        }
+
+        /**
+         * Clean up any quarantined files which have an index less than the index of the current segment as long as
+         * there are no cursors on previous segments.
+         *
+         * @param segmentIndex This cursors current segmentIndex
+         */
+        private void cleanUpQuarantined(long segmentIndex) {
+            if (m_quarantinedSegments.isEmpty()) {
+                return;
+            }
+
+            for (ReadCursor cursor : m_readCursors.values()) {
+                if (cursor == this) {
+                    continue;
+                }
+                long otherIndex = cursor.getSegmentIndex();
+                if (otherIndex == -1 || segmentIndex > otherIndex) {
+                    return;
+                }
+
+                if (segmentIndex < otherIndex) {
+                    continue;
+                }
+
+                // Only delete any segments if the other cursor has definitively polled the first entry in the segment
+                PBDSegmentReader segmentReader = cursor.getCurrentReader();
+                if (segmentReader == null || segmentReader.readIndex() == 0) {
+                    return;
+                }
+            }
+
+            deleteQuarantineSegmentsBefore(segmentIndex);
         }
 
         @Override
@@ -327,6 +371,12 @@ public class PersistentBinaryDeque implements BinaryDeque {
             }
         }
 
+        private PBDSegmentReader getCurrentReader() {
+            if (m_segment == null) {
+                return null;
+            }
+            return m_segment.getReader(m_cursorId);
+        }
     }
 
     public static final OutputContainerFactory UNSAFE_CONTAINER_FACTORY = new UnsafeOutputContainerFactory();
@@ -345,6 +395,7 @@ public class PersistentBinaryDeque implements BinaryDeque {
     //Segments that are no longer being written to and can be polled
     //These segments are "immutable". They will not be modified until deletion
     private final TreeMap<Long, PBDSegment> m_segments = new TreeMap<>();
+    private final NavigableMap<Long, File> m_quarantinedSegments = new TreeMap<>();
     private volatile boolean m_closed = false;
     private final HashMap<String, ReadCursor> m_readCursors = new HashMap<>();
     private int m_numObjects;
@@ -466,7 +517,7 @@ public class PersistentBinaryDeque implements BinaryDeque {
      */
     private void parseFiles() throws IOException {
 
-        HashMap<Long, File> filesById = new HashMap<>();
+        HashMap<Long, Pair<File, PbdSegmentName>> filesById = new HashMap<>();
         PairSequencer<Long> sequencer = new PairSequencer<>();
         try {
             for (File file : m_path.listFiles()) {
@@ -501,7 +552,7 @@ public class PersistentBinaryDeque implements BinaryDeque {
                 if (m_segmentCounter < maxCnt) {
                     m_segmentCounter = maxCnt;
                 }
-                filesById.put(segmentName.m_id, file);
+                filesById.put(segmentName.m_id, Pair.of(file, segmentName));
                 sequencer.add(new Pair<Long, Long>(segmentName.m_prevId, segmentName.m_id));
             }
 
@@ -516,9 +567,13 @@ public class PersistentBinaryDeque implements BinaryDeque {
             m_initializedFromExistingFiles = true;
             if (filesById.size() == 1) {
                 // Common case, only 1 PBD segment
-                for (Map.Entry<Long, File> entry: filesById.entrySet()) {
-                    PBDSegment seg = newSegment(1, entry.getKey(), entry.getValue());
-                    recoverSegment(seg);
+                for (Map.Entry<Long, Pair<File, PbdSegmentName>> entry: filesById.entrySet()) {
+                    Pair<File, PbdSegmentName> value=entry.getValue();
+                    if (value.getSecond().m_quarantined) {
+                        m_quarantinedSegments.put(1L, value.getFirst());
+                    } else {
+                        recoverSegment(1, entry.getKey(), value.getFirst());
+                    }
                     break;
                 }
             } else {
@@ -531,16 +586,19 @@ public class PersistentBinaryDeque implements BinaryDeque {
                     throw new IOException("Found " + sequences.size() + " PBD sequences for " + m_nonce);
                 }
                 Deque<Long> sequence = sequences.getFirst();
-                Long index = 1L;
+                long index = 1L;
                 for (Long segmentId : sequence) {
-                    File file = filesById.get(segmentId);
-                    if (file == null) {
+                    Pair<File, PbdSegmentName> pair = filesById.get(segmentId);
+                    if (pair == null) {
                         // This is an Id in the sequence referring to a previous file that
                         // was deleted, so move on.
                         continue;
                     }
-                    PBDSegment seg = newSegment(index++, segmentId, filesById.get(segmentId));
-                    recoverSegment(seg);
+                    if (pair.getSecond().m_quarantined) {
+                        m_quarantinedSegments.put(index++, pair.getFirst());
+                    } else {
+                        recoverSegment(index++, segmentId, pair.getFirst());
+                    }
                 }
             }
         } catch (CyclicSequenceException e) {
@@ -580,6 +638,22 @@ public class PersistentBinaryDeque implements BinaryDeque {
         }
     }
 
+    private void quarantineSegment(PBDSegment segment, int decrementEntryCount) throws IOException {
+        try {
+            File quarantinedFile = PbdSegmentName.asQuarantinedFile(segment.file());
+            if (!segment.file().renameTo(quarantinedFile)) {
+                throw new IOException("Failed to quarantine segment: " + segment.file());
+            }
+
+            Long index = segment.segmentIndex();
+            m_segments.remove(index);
+            m_quarantinedSegments.put(index, quarantinedFile);
+            m_numObjects -= decrementEntryCount;
+        } finally {
+            segment.close();
+        }
+    }
+
     /**
      * Recover a PBD segment and add it to m_segments
      *
@@ -587,30 +661,38 @@ public class PersistentBinaryDeque implements BinaryDeque {
      * @param deleteEmpty
      * @throws IOException
      */
-    private void recoverSegment(PBDSegment qs) throws IOException {
+    private void recoverSegment(long segmentIndex, long segmentId, File file) throws IOException {
+        PBDSegment segment = newSegment(segmentIndex, segmentId, file);
 
-        if (qs.getNumEntries() == 0) {
-            if (m_usageSpecificLog.isDebugEnabled()) {
-                m_usageSpecificLog.debug(
-                        "Found Empty Segment with entries: " + qs.getNumEntries() + " For: " + qs.file().getName());
-                m_usageSpecificLog.debug("Segment " + qs.file()
-                + " (final: " + qs.isFinal() + "), will be closed and deleted during init");
+        try {
+            if (segment.getNumEntries() == 0) {
+                if (m_usageSpecificLog.isDebugEnabled()) {
+                    m_usageSpecificLog.debug("Found Empty Segment with entries: " + segment.getNumEntries() + " For: "
+                            + segment.file().getName());
+                    m_usageSpecificLog.debug("Segment " + segment.file() + " (final: " + segment.isFinal()
+                            + "), will be closed and deleted during init");
+                }
+                segment.closeAndDelete();
+                return;
             }
-            qs.closeAndDelete();
-            return;
-        }
 
-        // Any recovered segment that is not final should be checked
-        // for internal consistency.
-        if (!qs.isFinal()) {
-            LOG.warn("Segment " + qs.file()
-            + " (final: " + qs.isFinal() + "), has been recovered but is not in a final state");
-        } else if (m_usageSpecificLog.isDebugEnabled()) {
-            m_usageSpecificLog.debug("Segment " + qs.file()
-                + " (final: " + qs.isFinal() + "), has been recovered");
+            // Any recovered segment that is not final should be checked
+            // for internal consistency.
+            if (!segment.isFinal()) {
+                LOG.warn("Segment " + segment.file() + " (final: " + segment.isFinal()
+                        + "), has been recovered but is not in a final state");
+            } else if (m_usageSpecificLog.isDebugEnabled()) {
+                m_usageSpecificLog
+                        .debug("Segment " + segment.file() + " (final: " + segment.isFinal() + "), has been recovered");
+            }
+            m_segments.put(segment.segmentIndex(), segment);
+        } catch (IOException e) {
+            Log.warn("Failed to retrieve entry count from segment " + segment.file() + ". Quarantining segment", e);
+            quarantineSegment(segment, 0);
+            return;
+        } finally {
+            segment.close();
         }
-        qs.close();
-        m_segments.put(qs.segmentIndex(), qs);
     }
 
     private int countNumObjects() throws IOException {
@@ -643,11 +725,20 @@ public class PersistentBinaryDeque implements BinaryDeque {
          * Iterator all the objects in all the segments and pass them to the truncator
          * When it finds the truncation point
          */
+        List<PBDSegment> toQuarantine = new ArrayList<>();
         Long lastSegmentIndex = null;
         for (PBDSegment segment : m_segments.values()) {
             final long segmentIndex = segment.segmentIndex();
 
-            final int truncatedEntries = segment.parseAndTruncate(truncator);
+            final int truncatedEntries;
+            try {
+                truncatedEntries = segment.parseAndTruncate(truncator);
+            } catch (IOException e) {
+                LOG.warn("Error performing parse and trunctate on segment " + segment.file()
+                        + ". Marking segment quarantined", e);
+                toQuarantine.add(segment);
+                continue;
+            }
 
             if (truncatedEntries == -1) {
                 // This whole segment will be truncated in the truncation loop below
@@ -663,6 +754,10 @@ public class PersistentBinaryDeque implements BinaryDeque {
             // should move on to the next segment.
         }
 
+        for (PBDSegment segment : toQuarantine) {
+            quarantineSegment(segment, segment.getNumEntries());
+        }
+
         /*
          * If it was found that no truncation is necessary, lastSegmentIndex will be null.
          * Return and the parseAndTruncate is a noop, except for the finalization.
@@ -670,6 +765,7 @@ public class PersistentBinaryDeque implements BinaryDeque {
         if (lastSegmentIndex == null)  {
             // Reopen the last segment for write - ensure it is not final
             PBDSegment lastSegment = peekLastSegment();
+            assert lastSegment.getNumEntries() == 0 : "Segment has entries: " + lastSegment.file();
             lastSegment.openNewSegment(m_compress);
 
             if (m_usageSpecificLog.isDebugEnabled()) {
@@ -681,13 +777,9 @@ public class PersistentBinaryDeque implements BinaryDeque {
         /*
          * Now truncate all the segments after the truncation point.
          */
-        Iterator<Long> iterator = m_segments.descendingKeySet().iterator();
+        Iterator<PBDSegment> iterator = m_segments.tailMap(lastSegmentIndex, false).values().iterator();
         while (iterator.hasNext()) {
-            Long segmentId = iterator.next();
-            if (segmentId <= lastSegmentIndex) {
-                break;
-            }
-            PBDSegment segment = m_segments.get(segmentId);
+            PBDSegment segment = iterator.next();
             m_numObjects -= segment.getNumEntries();
             iterator.remove();
 
@@ -698,6 +790,12 @@ public class PersistentBinaryDeque implements BinaryDeque {
                 m_usageSpecificLog.debug("Segment " + segment.file()
                     + " (final: " + segment.isFinal() + "), has been closed and deleted by truncator");
             }
+        }
+
+        // Truncate all quarantined segments after the truncation point too
+        Iterator<File> quarantineIterator = m_quarantinedSegments.tailMap(lastSegmentIndex, false).values().iterator();
+        while (quarantineIterator.hasNext()) {
+            quarantineIterator.next().delete();
         }
 
         /*
@@ -773,6 +871,8 @@ public class PersistentBinaryDeque implements BinaryDeque {
             closeAndDeleteSegment(segmentToDelete);
             iter.remove();
         }
+
+        deleteQuarantineSegmentsBefore(segmentId);
     }
 
     @Override
@@ -857,6 +957,16 @@ public class PersistentBinaryDeque implements BinaryDeque {
         }
         segment.closeAndDelete();
         m_numDeleted += toDelete;
+    }
+
+    private void deleteQuarantineSegmentsBefore(Long index) {
+        if (!m_quarantinedSegments.isEmpty()) {
+            Iterator<File> iter = m_quarantinedSegments.headMap(index, false).values().iterator();
+            while (iter.hasNext()) {
+                iter.next().delete();
+                iter.remove();
+            }
+        }
     }
 
     @Override
@@ -1087,6 +1197,12 @@ public class PersistentBinaryDeque implements BinaryDeque {
             closeAndDeleteSegment(qs);
         }
         m_segments.clear();
+
+        for (File quarantined : m_quarantinedSegments.values()) {
+            quarantined.delete();
+        }
+        m_quarantinedSegments.clear();
+
         m_closed = true;
     }
 
@@ -1230,11 +1346,22 @@ public class PersistentBinaryDeque implements BinaryDeque {
             return;
         }
 
+        List<PBDSegment> toQuarantine = new ArrayList<>();
+
         /*
          * Iterator all the objects in all the segments and pass them to the scanner
          */
         for (PBDSegment segment : m_segments.values()) {
-            m_numObjects -= segment.scan(scanner);
+            try {
+                m_numObjects -= segment.scan(scanner);
+            } catch (IOException e) {
+                LOG.warn("Error scanning segment: " + segment.file() + ". Qurantining segment.");
+                toQuarantine.add(segment);
+            }
+        }
+
+        for (PBDSegment segment : toQuarantine) {
+            quarantineSegment(segment, segment.getNumEntries());
         }
 
         return;

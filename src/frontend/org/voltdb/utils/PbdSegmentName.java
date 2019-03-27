@@ -34,8 +34,9 @@ import org.voltcore.logging.VoltLogger;
  */
 public class PbdSegmentName {
     private static final String PBD_SUFFIX = ".pbd";
+    private static final String PBD_QUARANTINED = "_q";
     private static final MessageFormat FORMAT = new MessageFormat(
-            "{0}_{1,number,0000000000}_{2,number,0000000000}" + PBD_SUFFIX);
+            "{0}_{1,number,0000000000}_{2,number,0000000000}{3}" + PBD_SUFFIX);
 
     private static final PbdSegmentName NOT_PBD = new PbdSegmentName(Result.NOT_PBD);
     private static final PbdSegmentName INVALID_NAME = new PbdSegmentName(Result.INVALID_NAME);
@@ -48,9 +49,24 @@ public class PbdSegmentName {
     public final long m_id;
     /** The id of the previous segment */
     public final long m_prevId;
+    /** Whether or not this PBD segment was marked quarantined */
+    public final boolean m_quarantined;
 
-    public static String createName(String nonce, long id, long prevId) {
-        return FORMAT.format(new Object[] { nonce, id, prevId });
+    public static String createName(String nonce, long id, long prevId, boolean quarantine) {
+        return FORMAT.format(new Object[] { nonce, id, prevId, quarantine ? PBD_QUARANTINED : "" });
+    }
+
+    public static File asQuarantinedFile(File file) {
+        String fileName = file.getName();
+        if (!isPbdFile(fileName)) {
+            throw new IllegalArgumentException("File is not a pbd: " + file);
+        }
+        if (isQuarantined(fileName)) {
+            throw new IllegalArgumentException("File is already quarantined: " + file);
+        }
+
+        return new File(file.getParentFile(),
+                fileName.substring(0, fileName.length() - PBD_SUFFIX.length()) + PBD_QUARANTINED + PBD_SUFFIX);
     }
 
     public static PbdSegmentName parseFile(VoltLogger logger, File file) {
@@ -58,14 +74,21 @@ public class PbdSegmentName {
     }
 
     public static PbdSegmentName parseName(VoltLogger logger, String fileName) {
-        if (!fileName.endsWith(PBD_SUFFIX)) {
+        if (!isPbdFile(fileName)) {
             if (logger.isTraceEnabled()) {
                 logger.trace("File " + fileName + " is not a pbd");
             }
             return NOT_PBD;
         }
-        int fileNameLength = fileName.length() - PBD_SUFFIX.length();
-        int startOfPrevId = fileName.lastIndexOf('_');
+        int endOfPrevId = fileName.length() - PBD_SUFFIX.length();
+
+        boolean quarantined = false;
+        if (isQuarantined(fileName)) {
+            quarantined = true;
+            endOfPrevId -= PBD_QUARANTINED.length();
+        }
+
+        int startOfPrevId = fileName.lastIndexOf('_', endOfPrevId - 1);
         if (startOfPrevId <= 0) {
             if (logger.isTraceEnabled()) {
                 logger.trace("File " + fileName + " does not have a _ in it for previous id");
@@ -83,27 +106,39 @@ public class PbdSegmentName {
         long id, prevId;
         try {
             id = Long.parseLong(fileName.substring(startOfId + 1, startOfPrevId));
-            prevId = Long.parseLong(fileName.substring(startOfPrevId + 1, fileNameLength));
+            prevId = Long.parseLong(fileName.substring(startOfPrevId + 1, endOfPrevId));
         } catch (NumberFormatException e) {
             logger.warn("Failed to parse IDs in " + fileName);
             return INVALID_NAME;
         }
 
-        return new PbdSegmentName(fileName.substring(0, startOfId), id, prevId);
+        return new PbdSegmentName(fileName.substring(0, startOfId), id, prevId, quarantined);
+    }
+
+    private static boolean isPbdFile(String fileName) {
+        return fileName.endsWith(PBD_SUFFIX);
+    }
+
+    private static boolean isQuarantined(String fileName) {
+        int endOfName = fileName.length() - PBD_SUFFIX.length();
+        return fileName.regionMatches(endOfName - PBD_QUARANTINED.length(), PBD_QUARANTINED, 0,
+                PBD_QUARANTINED.length());
     }
 
     private PbdSegmentName(Result result) {
-        this.m_result = result;
-        this.m_nonce = null;
-        this.m_id = -1;
-        this.m_prevId = -1;
+        m_result = result;
+        m_nonce = null;
+        m_id = -1;
+        m_prevId = -1;
+        m_quarantined = false;
     }
 
-    private PbdSegmentName(String m_nonce, long m_id, long m_prevId) {
-        this.m_result = Result.OK;
-        this.m_nonce = m_nonce;
-        this.m_id = m_id;
-        this.m_prevId = m_prevId;
+    private PbdSegmentName(String nonce, long id, long prevId, boolean quarantined) {
+        m_result = Result.OK;
+        m_nonce = nonce;
+        m_id = id;
+        m_prevId = prevId;
+        m_quarantined = quarantined;
     }
 
     public enum Result {

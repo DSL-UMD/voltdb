@@ -112,6 +112,10 @@ public abstract class VoltProcedure {
         return m_runner.getUniqueId();
     }
 
+    public long getTxnId() {
+        return m_runner.getTransactionId();
+    }
+    
     /**
      * Get the ID of cluster that the client connects to.
      * @return An ID that identifies the VoltDB cluster
